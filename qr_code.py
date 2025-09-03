@@ -1,6 +1,6 @@
 # qr_display.py
 import qrcode
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import tkinter as tk
 from dotenv import load_dotenv
 import os
@@ -22,6 +22,9 @@ def create_display():
     root = tk.Tk()
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
+    
+    # Print screen dimensions to console
+    print(f"Screen dimensions: {screen_width} x {screen_height}")
     
     # Load and process the background image
     try:
@@ -54,22 +57,59 @@ def create_display():
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=8,  # Smaller box size for top-right positioning
-        border=2,    # Smaller border
+        box_size=16,  # Doubled size for better visibility
+        border=2,     # Smaller border
     )
     qr.add_data(data)
     qr.make(fit=True)
     
-    qr_img = qr.make_image(fill_color="white", back_color="black")
+    # Create QR code with explicit RGB mode
+    qr_img = qr.make_image(fill_color="white", back_color="black").convert('RGB')
     
     # Position QR code in top right with margins
-    qr_size = qr_img.size[0]  # QR codes are square
+    qr_width, qr_height = qr_img.size
     margin = 20  # Margin from edges
-    qr_x = screen_width - qr_size - margin
+    qr_x = screen_width - qr_width - margin
     qr_y = margin
     
-    # Paste QR code onto the canvas
+    # Ensure coordinates are valid
+    if qr_x < 0:
+        qr_x = margin
+    if qr_y < 0:
+        qr_y = margin
+    
+    # Paste QR code onto the canvas using simple (x, y) coordinates
+    # Both images are now in RGB mode, so this should work
     canvas_image.paste(qr_img, (qr_x, qr_y))
+    
+    # Add text at the bottom
+    draw = ImageDraw.Draw(canvas_image)
+    text = "Scan the QR code inside the app to connect"
+    
+    # Try to use a system font, fallback to default if not available
+    try:
+        # Try different font sizes and families
+        font_size = 72  # Doubled from 36 to 72
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except (OSError, IOError):
+        try:
+            # Fallback for different systems
+            font = ImageFont.truetype("arial.ttf", 72)  # Doubled from 36 to 72
+        except (OSError, IOError):
+            # Final fallback to default font
+            font = ImageFont.load_default()
+    
+    # Get text dimensions for centering
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    
+    # Calculate position for centered text at bottom
+    text_x = (screen_width - text_width) // 2
+    text_y = screen_height - text_height - 40  # 40px margin from bottom
+    
+    # Draw text with white color
+    draw.text((text_x, text_y), text, font=font, fill='white')
     
     return root, canvas_image
 
@@ -100,12 +140,25 @@ label.pack(fill=tk.BOTH, expand=True)
 root.configure(bg='black')  # Set window background to black
 root.attributes("-fullscreen", True)
 root.bind("<Escape>", lambda e: root.destroy())  # Press Esc to quit
+root.bind("<Control-c>", lambda e: signal_handler(None, None))  # Ctrl+C binding
 
 # Handle window close button
 root.protocol("WM_DELETE_WINDOW", lambda: signal_handler(None, None))
 
+# Add periodic check for signal handling
+def check_for_interrupts():
+    """Periodically check if we should quit (helps with Ctrl+C)"""
+    try:
+        root.after(100, check_for_interrupts)  # Check every 100ms
+    except tk.TclError:
+        # Window was destroyed
+        pass
+
 print(f"Display created with QR code containing: {data}")
-print("Press Escape to quit or use Ctrl+C")
+print("Press Escape or Ctrl+C to quit")
+
+# Start the periodic check
+check_for_interrupts()
 
 try:
     root.mainloop()
