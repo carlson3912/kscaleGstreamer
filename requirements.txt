@@ -1,0 +1,5 @@
+# Python dependencies for gstreamer project
+python-dotenv>=1.0.0
+websockets>=11.0.0
+numpy>=1.24.0
+# Add other dependencies as needed

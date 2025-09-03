@@ -1,0 +1,444 @@
+import asyncio
+import json
+import ssl
+import websockets
+from opencvFix import undistort_gst
+import gi
+import numpy as np
+import os
+
+# Enable GstShark tracers and debug level
+
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstWebRTC', '1.0')
+gi.require_version('GstSdp', '1.0')
+from gi.repository import Gst, GstWebRTC, GstSdp, GLib
+
+Gst.init(None)
+
+PIPELINE_DESC = '''
+webrtcbin name=sendrecv bundle-policy=max-bundle stun-server=stun://stun.l.google.com:19302
+'''
+
+VIDEO_SOURCES = [
+    "/base/axi/pcie@1000120000/rp1/i2c@80000/ov5647@36",
+    "/base/axi/pcie@1000120000/rp1/i2c@88000/ov5647@36"
+]
+
+AUDIO_SOURCE = "hw:0,0"
+async def glib_main_loop_iteration():
+    while True:
+        # Process all pending GLib events without blocking
+        while GLib.main_context_default().iteration(False):
+            pass
+        # Yield control back to asyncio, adjust delay as needed
+        await asyncio.sleep(0.01)
+def undistort_frame(appsink, appsrc):
+    sample = appsink.emit("pull-sample")
+    if sample is None:
+        print("No sample received!")
+        return Gst.FlowReturn.OK
+
+    buf = sample.get_buffer()
+    caps = appsink.get_property("caps")
+    structure = caps.get_structure(0)
+    width = structure.get_value("width")
+    height = structure.get_value("height")
+
+    # Map GStreamer buffer to numpy array
+    result, map_info = buf.map(Gst.MapFlags.READ)
+    if not result:
+        print("Failed to map buffer")
+        return Gst.FlowReturn.OK
+
+    try:
+        # Create numpy array from buffer
+        frame = np.frombuffer(map_info.data, dtype=np.uint8)
+        frame = frame.reshape((height, width, 3))  # BGR format assumed
+
+        # Apply undistortion
+        frame_undistorted = undistort_gst(frame)
+
+        # Convert back to Gst.Buffer
+        out_buf = Gst.Buffer.new_allocate(None, frame_undistorted.nbytes, None)
+        out_buf.fill(0, frame_undistorted.tobytes())
+
+        # Preserve timestamps
+        out_buf.pts = buf.pts
+        out_buf.dts = buf.dts
+        out_buf.duration = buf.duration
+        # Push buffer to appsrc
+        appsrc.emit("push-buffer", out_buf)
+
+    finally:
+        buf.unmap(map_info)
+
+    return Gst.FlowReturn.OK
+
+
+class WebRTCServer:
+    def __init__(self, loop):
+        self.pipe = None
+        self.webrtc = None
+        self.ws = None  # active client connection
+        self.loop = loop
+        self.added_data_channel = False
+        self.added_streams = 0
+    def connect_audio(self, webrtc):
+        audio_src = Gst.ElementFactory.make("alsasrc", "audio_src")
+        audio_conv = Gst.ElementFactory.make("audioconvert", "audio_conv")
+        audio_resample = Gst.ElementFactory.make("audioresample", "audio_resample")
+        audio_queue = Gst.ElementFactory.make("queue", "audio_queue")
+        opus_enc = Gst.ElementFactory.make("opusenc", "opus_enc")
+        rtp_pay = Gst.ElementFactory.make("rtpopuspay", "rtp_pay")
+        rtp_pay.set_property("pt", 98)
+
+        for e in [audio_src, audio_conv, audio_resample, audio_queue, opus_enc, rtp_pay]:
+            self.pipe.add(e)
+
+        audio_src.link(audio_conv)
+        audio_conv.link(audio_resample)
+        audio_resample.link(audio_queue)
+        audio_queue.link(opus_enc)
+        opus_enc.link(rtp_pay)
+
+        # --- Request audio pad from webrtcbin ---
+        # Use caps for RTP/OPUS
+        sink_pad = webrtc.get_request_pad(f"sink_1")  # or "sink_%u" may work
+        src_pad = rtp_pay.get_static_pad("src")
+
+        if not sink_pad or not src_pad:
+            print("Failed to get pads for linking audio")
+            return
+
+        ret = src_pad.link(sink_pad)
+        if ret != Gst.PadLinkReturn.OK:
+            print("Failed to link audio to webrtcbin:", ret)
+        else:
+            print("Audio linked to webrtcbin")
+
+    def start_pipeline(self, active_cameras: list[int] = [1], audio: bool = True, undistort: bool = False):
+        print("Starting pipeline")
+        self.pipe = Gst.Pipeline.new("pipeline")
+        webrtc = Gst.parse_launch(PIPELINE_DESC)
+        self.pipe.add(webrtc)
+        print(self.pipe)
+
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_bus_message)
+        self.webrtc = self.pipe.get_by_name("sendrecv")
+        self.webrtc.set_property("latency", 0)
+        self.webrtc.connect("on-ice-candidate", self.send_ice_candidate_message)
+        self.webrtc.connect("on-data-channel", self.on_data_channel)
+        self.webrtc.connect("pad-added", self.on_incoming_stream)
+        video_sources = []
+        for i in range(len(active_cameras)):
+            video_sources.append(VIDEO_SOURCES[active_cameras[i]])
+        for i, cam_name in enumerate(video_sources):
+            # Source + capsfilter: force YUY2 output
+            src = Gst.ElementFactory.make("libcamerasrc", f"libcamerasrc{i}")
+            src.set_property("camera-name", cam_name)
+
+            caps = Gst.Caps.from_string("video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1")
+            capsfilter = Gst.ElementFactory.make("capsfilter", f"caps{i}")
+            capsfilter.set_property("caps", caps)
+
+            # Convert to BGR for OpenCV
+            conv = Gst.ElementFactory.make("videoconvert", f"conv{i}")
+            sink_queue = Gst.ElementFactory.make("queue", f"sink_queue{i}")
+            sink_queue.set_property("leaky", 2)
+            sink_queue.set_property("max-size-buffers", 2)
+            for e in [src, capsfilter, conv, sink_queue]:
+                self.pipe.add(e)
+            # Link source -> conv -> queue
+            src.link(capsfilter)
+            capsfilter.link(conv)
+            conv.link(sink_queue)
+
+            upstream_element = sink_queue
+           
+            # --- Appsink for OpenCV processing ---
+            if undistort:
+                appsink = Gst.ElementFactory.make("appsink", f"appsink{i}")
+                appsink.set_property("emit-signals", True)
+                appsink.set_property("sync", False)
+                appsink.set_property("max-buffers", 1)
+                appsink.set_property("drop", True)
+                appsink_caps = Gst.Caps.from_string("video/x-raw,format=BGR,width=1280,height=720,framerate=30/1")
+                appsink.set_property("caps", appsink_caps)
+                # Appsrc to push processed frames back
+                appsrc = Gst.ElementFactory.make("appsrc", f"appsrc{i}")
+                appsrc.set_property("format", Gst.Format.TIME)
+                appsrc.set_property("is-live", True)
+                appsrc.set_property("block", True)
+                appsrc.set_property("do-timestamp", True)
+                appsrc_caps = Gst.Caps.from_string("video/x-raw,format=BGR,width=1280,height=720,framerate=30/1")
+                appsrc.set_property("caps", appsrc_caps)
+
+                appsink.connect("new-sample", undistort_frame, appsrc)
+
+                # Queue + convert to I420 + encoder + payloader
+                vidconvert = Gst.ElementFactory.make("videoconvert", f"conv2{i}")
+                i420_caps = Gst.Caps.from_string("video/x-raw,format=I420,width=1280,height=720,framerate=30/1")
+                i420filter = Gst.ElementFactory.make("capsfilter", f"i420filter{i}")
+                i420filter.set_property("caps", i420_caps)
+                for e in [appsink, appsrc, vidconvert, i420filter]:
+                    self.pipe.add(e)
+
+                upstream_element.link(appsink)
+                #appsrc was directly linked to videoconvert
+                appsrc.link(vidconvert)
+                vidconvert.link(i420filter)
+                upstream_element = i420filter
+
+            vp8enc = Gst.ElementFactory.make("vp8enc", f"vp8enc{i}")
+            vp8enc.set_property("deadline", 1)
+            vp8enc.set_property("keyframe-max-dist", 30) 
+            pay = Gst.ElementFactory.make("rtpvp8pay", f"pay{i}")
+            pay.set_property("pt", 96 + i)
+    
+            # Add elements to pipeline
+            for e in [vp8enc, pay]:
+                self.pipe.add(e)
+            
+            upstream_element.link(vp8enc)
+            vp8enc.link(pay)
+            print(f"Camera {i} encoding: AppSrc (BGR) -> VideoConvert -> I420 -> VP8 -> RTP")
+
+            src_pad = src.get_static_pad("src")
+            sink_pad = webrtc.get_request_pad(f"sink_{i * 2}")
+            if not sink_pad:
+                print(f"Failed to get sink pad for stream {i}")
+            else:
+                src_pad = pay.get_static_pad("src")
+                ret = src_pad.link(sink_pad)
+                print("Pad link result", ret)
+
+        if audio:
+            self.connect_audio(webrtc)
+        self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
+        self.pipe.set_state(Gst.State.PLAYING)
+        Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline_graph")
+        
+        # os.environ["GST_DEBUG"] = "GST_TRACER:7"
+        # os.environ["GST_TRACERS"] = "cpuusage;queuelevel;interlatency;proctime;bitrate;framerate;buffer;scheduling;graphic"
+        print("Pipeline started")
+
+    def on_bus_message(self, bus, message):
+        """Handle messages from the GStreamer bus, specifically for latency."""
+        t = message.type
+        if t == Gst.MessageType.LATENCY:
+            print("Received a LATENCY message. Recalculating latency.")
+            self.pipe.recalculate_latency()
+
+        return GLib.SOURCE_CONTINUE
+    
+    def close_pipeline(self):
+        if self.pipe:
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe = None
+            self.webrtc = None
+            self.added_data_channel = False
+
+    def on_message_string(self, channel, message):
+        print("Received:", message)
+
+    def on_data_channel(self, webrtc, channel):
+        print("New data channel:", channel.props.label)
+        channel.connect("on-message-string", self.on_message_string)
+
+    def on_incoming_decodebin_stream(self, _, pad):
+        # This method is now used only for audio stream handling after opusdec
+        if not pad.has_current_caps():
+            print(pad, 'has no caps, ignoring')
+            return
+
+        caps = pad.get_current_caps()
+        print("Processing decoded stream caps:", caps.get_structure(0))
+        s = caps.get_structure(0)
+        
+        name = s.get_name()
+        print("Stream type:", name)
+        
+        if name.startswith('audio'):
+            # Create audio processing chain: queue -> convert -> resample -> sink
+            stream_id = f"audio_{self.added_streams}"
+            q = Gst.ElementFactory.make('queue', f'queue_{stream_id}')
+            conv = Gst.ElementFactory.make('audioconvert', f'conv_{stream_id}')
+            resample = Gst.ElementFactory.make('audioresample', f'resample_{stream_id}')
+            sink = Gst.ElementFactory.make('autoaudiosink', f'sink_{stream_id}')
+            
+            # Add elements to pipeline
+            for element in [q, conv, resample, sink]:
+                self.pipe.add(element)
+                element.sync_state_with_parent()
+            
+            # Link the chain
+            pad.link(q.get_static_pad('sink'))
+            q.link(conv)
+            conv.link(resample)
+            resample.link(sink)
+            
+            print(f"Created audio processing chain for stream {stream_id}")
+        else:
+            print(f"Unexpected stream type in audio handler: {name}")
+
+        # Debug snapshots
+        Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, f"pipeline_graph_{self.added_streams}")
+        async def delayed_snapshot(pipe, name, delay=5.0):
+            await asyncio.sleep(delay)
+            print("Taking DELAYED snapshot")
+            Gst.debug_bin_to_dot_file(pipe, Gst.DebugGraphDetails.ALL, name)
+
+        asyncio.run_coroutine_threadsafe(
+            delayed_snapshot(self.pipe, f"pipeline_graph_delayed{self.added_streams}", 10.0),
+            self.loop
+        )
+
+
+    def on_incoming_stream(self, _, pad):
+        if pad.direction != Gst.PadDirection.SRC:
+            return
+        
+        # Get the caps to determine if this is video or audio
+        caps = pad.get_current_caps()
+        if not caps:
+            print("No caps available for incoming stream")
+            return
+            
+        structure = caps.get_structure(0)
+        media_type = structure.get_string("media")
+        encoding_name = structure.get_string("encoding-name")
+        
+        print(f"Incoming stream - Media: {media_type}, Encoding: {encoding_name}")
+        
+        if media_type == "video" and encoding_name == "VP8":
+            # Create direct video pipeline: vp8depay -> vp8dec -> autovideosink
+            vp8depay = Gst.ElementFactory.make('rtpvp8depay', f'vp8depay_{self.added_streams}')
+            vp8depay.set_property("request-keyframe", True)
+            vp8depay.set_property("wait-for-keyframe", True)
+            vp8dec = Gst.ElementFactory.make('vp8dec', f'vp8dec_{self.added_streams}')
+            autovideosink = Gst.ElementFactory.make('autovideosink', f'autovideosink_{self.added_streams}')
+            
+            # Add elements to pipeline
+            for element in [vp8depay, vp8dec, autovideosink]:
+                self.pipe.add(element)
+                element.sync_state_with_parent()
+            
+            # Link elements
+            vp8depay.link(vp8dec)
+            vp8dec.link(autovideosink)
+            
+            # Link the incoming pad to vp8depay
+            sink_pad = vp8depay.get_static_pad('sink')
+            pad.link(sink_pad)
+            
+            print("Created direct video pipeline: vp8depay -> vp8dec -> autovideosink")
+            
+        elif media_type == "audio" and encoding_name == "OPUS":
+            # Create direct audio pipeline: opusdepay -> opusdec -> audio handling
+            opusdepay = Gst.ElementFactory.make('rtpopusdepay', f'opusdepay_{self.added_streams}')
+            opusdec = Gst.ElementFactory.make('opusdec', f'opusdec_{self.added_streams}')
+            
+            # Add elements to pipeline
+            self.pipe.add(opusdepay)
+            self.pipe.add(opusdec)
+            opusdepay.sync_state_with_parent()
+            opusdec.sync_state_with_parent()
+            
+            # Link depay to decoder
+            opusdepay.link(opusdec)
+            
+            # Link the incoming pad to opusdepay
+            sink_pad = opusdepay.get_static_pad('sink')
+            pad.link(sink_pad)
+            
+            # Create a pad for the decoder output and connect it to audio handling
+            decoder_src_pad = opusdec.get_static_pad('src')
+            self.on_incoming_decodebin_stream(None, decoder_src_pad)
+            
+            print("Created direct audio pipeline: opusdepay -> opusdec -> audio handling")
+        else:
+            print(f"Unsupported stream type: {media_type}/{encoding_name}")
+            
+        self.added_streams += 1
+
+    def on_negotiation_needed(self, element):
+        print("Negotiation needed")
+        if self.added_data_channel:
+            print("Data channel already added")
+            return
+        self.added_data_channel = True
+        self.data_channel = self.webrtc.emit("create-data-channel", "chat", None)
+        if self.data_channel:
+            print("Data channel created on robot")
+            self.data_channel.connect("on-message-string", self.on_message_string)
+        
+        promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
+        self.webrtc.emit("create-offer", None, promise)
+
+    def on_offer_created(self, promise, _, __):
+        print("on offer created")
+        promise.wait()
+        reply = promise.get_reply()
+        offer = reply.get_value("offer")
+        print("offer:", offer)
+        self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
+        text = offer.sdp.as_text()
+        print("offertext:", text)
+        message = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
+        asyncio.run_coroutine_threadsafe(self.ws.send(message), self.loop)
+
+    def send_ice_candidate_message(self, _, mlineindex, candidate):
+        message = json.dumps({
+            'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}
+        })
+        asyncio.run_coroutine_threadsafe(self.ws.send(message), self.loop)
+
+    def handle_client_message(self, message):
+        print("Handling client message")
+        print(message)
+        msg = json.loads(message)
+        msg_type = msg.get('type', None)
+        msg_cameras = msg.get('cameras', [0])
+        msg_audio = msg.get('audio', True)
+        msg_undistort = msg.get('undistort', False)
+        if 'sdp' in msg and msg['sdp']['type'] == 'answer':
+            sdp = msg['sdp']['sdp']
+            res, sdpmsg = GstSdp.SDPMessage.new()
+            GstSdp.sdp_message_parse_buffer(sdp.encode(), sdpmsg)
+            answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
+            self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
+        elif 'ice' in msg:
+            ice = msg['ice']
+            self.webrtc.emit("add-ice-candidate", ice['sdpMLineIndex'], ice['candidate'])
+        elif(msg_type == "Negotiate"):
+            if(self.pipe):
+                self.close_pipeline()
+           
+            self.start_pipeline(msg_cameras, msg_audio, msg_undistort)
+       
+            return
+            
+    async def websocket_handler(self, ws):
+        print("Client connected")
+        self.ws = ws
+        async for msg in ws:
+            self.handle_client_message(msg)
+        print("Client disconnected")
+        self.close_pipeline()
+
+async def main():
+    loop = asyncio.get_running_loop()
+    server = WebRTCServer(loop)
+    async def handler(websocket):
+        await server.websocket_handler(websocket)
+    asyncio.create_task(glib_main_loop_iteration())
+    async with websockets.serve(handler, "0.0.0.0", 8765):
+        print("WebSocket server running on ws://0.0.0.0:8765")
+        await asyncio.Future()  # run forever
+
+if __name__ == "__main__":
+    asyncio.run(main())
